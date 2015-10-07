@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,7 +224,15 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	csvRows := make(chan []string)
 
-	go e.scrape(csvRows)
+	parsed_uri, err := url.Parse(e.URI)
+	if err != nil {
+		panic(err)
+	}
+	if parsed_uri.Scheme == "unix" {
+		go e.scrapeUnix(csvRows)
+	} else {
+		go e.scrape(csvRows)
+	}
 
 	e.mutex.Lock() // To protect metrics from concurrent collects.
 	defer e.mutex.Unlock()
@@ -232,6 +242,61 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.totalScrapes
 	ch <- e.csvParseFailures
 	e.collectMetrics(ch)
+}
+
+func (e *Exporter) scrapeUnix(csvRows chan<- []string) {
+	defer close(csvRows)
+
+	e.totalScrapes.Inc()
+
+	parsed_uri, err := url.Parse(e.URI)
+	if err != nil {
+		panic(err)
+	}
+
+	conn, err := net.Dial("unix", parsed_uri.Path)
+	if err != nil {
+		e.up.Set(0)
+		log.Printf("Error connecting to %v: %v", e.URI, err)
+		return
+	}
+
+	_, err = conn.Write([]byte("show stat\n"))
+	if err != nil {
+		e.up.Set(0)
+		log.Printf("Error writing to %v: %v", e.URI, err)
+		return
+	}
+
+	resp := bufio.NewReader(conn)
+	if err != nil {
+		e.up.Set(0)
+		log.Printf("Error reading from %v: %v", e.URI, err)
+		return
+	}
+
+	defer conn.Close()
+	e.up.Set(1)
+
+	reader := csv.NewReader(resp)
+	reader.TrailingComma = true
+	reader.Comment = '#'
+
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("Error while reading CSV: %v", err)
+			e.csvParseFailures.Inc()
+			break
+		}
+		if len(row) == 0 {
+			continue
+		}
+		csvRows <- row
+	}
 }
 
 func (e *Exporter) scrape(csvRows chan<- []string) {
